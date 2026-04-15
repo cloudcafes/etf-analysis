@@ -10,6 +10,7 @@ import requests
 import urllib3
 from google import genai
 import time
+from zoneinfo import ZoneInfo
 
 # Suppress warnings for clean console output
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -18,10 +19,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ==============================
 # API KEYS & CONFIGURATION
 # ==============================
-GEMINI_API_KEY     = "AIzaSyA_kpQOQwpYiHoPShD1v4wF4HsP2bX5b-0"
-GEMINI_MODEL       = "gemini-3.1-flash-lite-preview"          
-TELEGRAM_BOT_TOKEN = "8747682342:AAG5f--5bePDBGjTFQDw0B7rLNGZFNkzQU8"
-TELEGRAM_CHAT_ID   = "-1003800058836"
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+GEMINI_MODEL       = "gemini-3.1-flash-lite-preview"
 
 DB_NAME = "sqlite:///etf_rotation.db"
 
@@ -106,11 +107,46 @@ def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
         return
 
     ai_prompt = (
-        "You are an expert quantitative financial analyst. Review the following daily ETF rotation snapshot. "
-        "Please provide a 3-bullet summary of the most critical actions (SELL alerts or NEW BUYS), "
-        "analyze the general momentum trend based on the HOLD list, and provide a brief, professional wrap-up.\n\n"
-        "[MARKET SNAPSHOT DATA]\n"
-        f"{snapshot_data.strip()}"
+    "You are a professional quantitative trading analyst.\n\n"
+
+    "Analyze the ETF rotation report below and generate a READY-TO-SEND TELEGRAM MESSAGE.\n\n"
+
+    "STRICT RULES:\n"
+    "- Keep output short, sharp, and actionable\n"
+    "- No explanations, no raw tables\n"
+    "- Focus only on decisions and market insight\n"
+    "- Use clean formatting with emojis\n"
+    "- Avoid listing too many ETFs\n\n"
+
+    "OUTPUT STRUCTURE:\n\n"
+
+    "🔥 Market:\n"
+    "- 1–2 lines describing overall market condition (breadth, trend, leadership)\n\n"
+
+    "📈 BUY:\n"
+    "- List ONLY new buy signals\n"
+    "- Format: ETF (Theme) – reason in 1 short line\n\n"
+
+    "🟡 HOLD:\n"
+    "- Mention only strongest leaders worth holding\n"
+    "- Do NOT list everything\n\n"
+
+    "❌ EXIT:\n"
+    "- Summarize weakness (sectors/themes), NOT full list\n\n"
+
+    "💰 Allocation:\n"
+    "- Clear capital allocation guidance (%, cash if needed)\n\n"
+
+    "⚠️ Risk:\n"
+    "- One-line key risk\n\n"
+
+    "TONE:\n"
+    "- Professional\n"
+    "- Confident\n"
+    "- No hype, no generic advice\n\n"
+
+    "[ETF REPORT DATA]\n"
+    f"{snapshot_data.strip()}"
     )
 
     for attempt in range(max_retries):
@@ -291,7 +327,8 @@ def print_clean_table(df, columns, headers):
 # ==============================
 
 def main():
-    today_str = datetime.now().strftime("%B %d, %Y")
+    ist_tz = ZoneInfo('Asia/Kolkata')
+    today_str = datetime.now(ist_tz).strftime("%B %d, %Y")
     
     print("=" * 80)
     print(f" ETF QUANTITATIVE INVESTMENT GUIDE | {today_str}".center(80))
@@ -309,7 +346,7 @@ def main():
     
     # Save to DB 
     save_df = df.drop(columns=["prev_action"])
-    save_df["date"] = datetime.now().date()
+    save_df["date"] = datetime.now(ist_tz).date()
     try:
         save_df.to_sql("etf_metrics", engine, if_exists="append", index=False)
     except:

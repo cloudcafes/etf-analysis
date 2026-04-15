@@ -9,6 +9,10 @@ on:
 
   workflow_dispatch:  # allows manual run
 
+# REQUIRED: Grants the action permission to push code back to your repo
+permissions:
+  contents: write
+
 jobs:
   run-etf:
     runs-on: ubuntu-latest
@@ -26,6 +30,17 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      # Ensure this matches the name of your python file
       - name: Run ETF script
         run: |
-          python etf_rotation.py
+          python etf_analyzer.py
+
+      # Auto-commits the database back to your GitHub repo so it persists
+      - name: Commit and Push DB
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add etf_rotation.db
+          
+          # This checks if the db changed. If yes, it commits and pushes. If no, it does nothing.
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update ETF database state" && git push)
