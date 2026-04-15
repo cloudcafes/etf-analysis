@@ -11,6 +11,7 @@ import urllib3
 from google import genai
 import time
 from zoneinfo import ZoneInfo
+import os
 
 # Suppress warnings for clean console output
 warnings.simplefilter(action='ignore', category=FutureWarning)
