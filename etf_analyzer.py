@@ -104,7 +104,6 @@ def send_telegram_message(text: str) -> bool:
     return success
 
 def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
-    """Sends the data to Gemini with automatic retries, then forwards to Telegram."""
     if not GEMINI_API_KEY or "YOUR_" in GEMINI_API_KEY: 
         print("⚠️ Missing Gemini API Key. Skipping AI Analysis.")
         return
@@ -154,13 +153,11 @@ def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
             else:
                 print("❌ Failed to send Telegram message.")
                 
-            return  # Exit function successfully if we make it here
+            return  
 
         except Exception as e:
             error_msg = str(e)
             print(f"❌ AI API Error: {error_msg}")
-            
-            # If it's a server overload (503) or rate limit (429), try again
             if "503" in error_msg or "429" in error_msg:
                 if attempt < max_retries - 1:
                     wait_time = (2 ** attempt) * 5 
@@ -172,13 +169,14 @@ def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
                 break
 
 # ==============================
-# POLITE CRAWLER FETCH & METRICS
+# FETCH & METRICS
 # ==============================
 
-def fetch_data(symbol, session, max_retries=3):
+def fetch_data(symbol, max_retries=3):
     for attempt in range(max_retries):
         try:
-            df = yf.download(symbol, period="1y", interval="1d", progress=False, session=session)
+            # Removed custom session. Letting yfinance use its built-in advanced curl_cffi handling.
+            df = yf.download(symbol, period="1y", interval="1d", progress=False)
             
             if df is not None and not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):
@@ -188,7 +186,7 @@ def fetch_data(symbol, session, max_retries=3):
                     df["symbol"] = symbol
                     return df
             
-            return None # Skip if not enough historical data
+            return None 
 
         except Exception as e:
             error_msg = str(e)
@@ -244,30 +242,21 @@ def calculate_metrics(df):
 def process_all():
     results = []
     total = len(ETF_LIST)
-    print(f"🚀 Fetching data for {total} ETFs (using polite pacing)...")
-
-    # Create a persistent session to mimic a standard browser
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive"
-    })
+    print(f"🚀 Fetching data for {total} ETFs (using internal yfinance spoofing)...")
 
     for idx, etf in enumerate(ETF_LIST, 1):
         sys.stdout.write(f"\r[{idx}/{total}] Fetching {etf}...".ljust(50))
         sys.stdout.flush()
 
-        df = fetch_data(etf, session)
+        df = fetch_data(etf)
 
         if df is not None:
             m = calculate_metrics(df)
             if m: results.append(m)
 
-        # Inject randomized jitter between 1.5 and 3.5 seconds to bypass WAF patterns
+        # Basic polite pacing
         if idx < total:
-            time.sleep(random.uniform(1.5, 3.5))
+            time.sleep(random.uniform(1.0, 2.5))
 
     print("\n✅ Data fetch complete.\n")
 
@@ -442,10 +431,7 @@ def main():
     sys.stdout = original_stdout 
     captured_report = output_buffer.getvalue()
 
-    # 1. Print the report to the console so you can see it locally
     print(captured_report)
-
-    # 2. Send the exact string in memory directly to AI & Telegram
     run_ai_analysis_and_notify(captured_report)
 
 if __name__ == "__main__":
