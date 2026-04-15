@@ -13,6 +13,11 @@ on:
 permissions:
   contents: write
 
+# FIX 5: Concurrency Protection (Prevents two overlapping runs from corrupting the DB)
+concurrency:
+  group: etf-db-update
+  cancel-in-progress: false
+
 jobs:
   run-etf:
     runs-on: ubuntu-latest
@@ -34,19 +39,48 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install --upgrade yfinance requests-ratelimiter
+          pip install --upgrade yfinance requests-ratelimiter pandas sqlalchemy google-genai
 
       # Ensure this matches the name of your python file
       - name: Run ETF script
         run: |
           python etf_analyzer.py
 
-      # Auto-commits the database back to your GitHub repo so it persists
+      # FIX 4: Atomic Git Persistence with Retries & Hard Failure
       - name: Commit and Push DB
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add etf_rotation.db
           
-          # This checks if the db changed. If yes, it commits and pushes. If no, it does nothing.
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update ETF database state" && git push)
+          # Check if there are changes. If no, exit cleanly.
+          if git diff --staged --quiet; then
+            echo "No database changes to commit."
+            exit 0
+          fi
+          
+          git commit -m "Auto-update ETF database state"
+          
+          # Retry loop for git push to prevent silent data loss on network failure
+          max_retries=3
+          attempt=1
+          success=false
+          
+          while [ $attempt -le $max_retries ]; do
+            echo "Attempt $attempt of $max_retries to push DB changes..."
+            if git push; then
+              echo "Push successful!"
+              success=true
+              break
+            else
+              wait_time=$((2 ** attempt * 5))
+              echo "Push failed. Retrying in $wait_time seconds..."
+              sleep $wait_time
+              attempt=$((attempt + 1))
+            fi
+          done
+          
+          if [ "$success" = false ]; then
+            echo "Failed to push database to remote after $max_retries attempts. Failing workflow."
+            exit 1
+          fi
