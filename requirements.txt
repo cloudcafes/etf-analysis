@@ -1,7 +1,7 @@
-yfinance==0.2.52
-pandas==2.2.3
-numpy==1.26.4
-sqlalchemy==2.0.36
-requests==2.32.3
-google-generativeai==0.8.3
+yfinance
+pandas
+numpy
+sqlalchemy
+requests
+google-generativeai
 google-genai
