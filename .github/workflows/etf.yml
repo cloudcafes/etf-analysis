@@ -29,6 +29,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+          pip install --upgrade yfinance requests-ratelimiter
 
       # Ensure this matches the name of your python file
       - name: Run ETF script
