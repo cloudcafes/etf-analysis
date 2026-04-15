@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 import requests
 import urllib3
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 from google import genai
 
 # Suppress warnings for clean console output
@@ -64,6 +64,13 @@ THEME_MAP = {
     "COMMOIETF.NS":"COMMODITY",
     "JUNIORBEES.NS":"NEXT50"
 }
+
+# FIX 7: Explicit Schema Control
+EXPECTED_COLUMNS = [
+    'symbol', 'theme', 'price', '50DMA', 'cycle', 'ret_1m', 'ret_3m', 
+    'volatility', 'avg_volume', 'pullback', 'stretch', 'rank', 
+    'exhausted', 'action', 'date'
+]
 
 engine = create_engine(DB_NAME)
 
@@ -175,7 +182,6 @@ def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
 def fetch_data(symbol, max_retries=3):
     for attempt in range(max_retries):
         try:
-            # Removed custom session. Letting yfinance use its built-in advanced curl_cffi handling.
             df = yf.download(symbol, period="1y", interval="1d", progress=False)
             
             if df is not None and not df.empty:
@@ -242,7 +248,7 @@ def calculate_metrics(df):
 def process_all():
     results = []
     total = len(ETF_LIST)
-    print(f"🚀 Fetching data for {total} ETFs (using internal yfinance spoofing)...")
+    print(f"🚀 Fetching data for {total} ETFs...")
 
     for idx, etf in enumerate(ETF_LIST, 1):
         sys.stdout.write(f"\r[{idx}/{total}] Fetching {etf}...".ljust(50))
@@ -254,7 +260,6 @@ def process_all():
             m = calculate_metrics(df)
             if m: results.append(m)
 
-        # Basic polite pacing
         if idx < total:
             time.sleep(random.uniform(1.0, 2.5))
 
@@ -309,21 +314,81 @@ def classify(df):
         
     return df
 
+# FIX 6: DB File Integrity Check
+def validate_db():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as e:
+        print(f"❌ DB Integrity Check Failed: {e}")
+        print("🚨 Database corrupted or inaccessible. Hard failing pipeline.")
+        sys.exit(1)
+
+# FIX 3: Reliable State Fetch (Distinct snapshot)
 def get_previous_states():
     try:
         insp = inspect(engine)
-        if not insp.has_table("etf_metrics"): return {}, "Never"
+        if not insp.has_table("etf_metrics"): 
+            return {}, "Never"
             
-        query_date = "SELECT MAX(date) FROM etf_metrics"
-        max_date = pd.read_sql(query_date, engine).iloc[0, 0]
-        
-        if not max_date: return {}, "Never"
+        with engine.connect() as conn:
+            max_date = conn.execute(text("SELECT MAX(date) FROM etf_metrics")).scalar()
             
-        query_data = f"SELECT symbol, action FROM etf_metrics WHERE date = '{max_date}'"
+        if not max_date: 
+            return {}, "Never"
+            
+        query_data = f"SELECT DISTINCT symbol, action FROM etf_metrics WHERE date = '{max_date}'"
         prev_df = pd.read_sql(query_data, engine)
         return dict(zip(prev_df['symbol'], prev_df['action'])), max_date
-    except:
+    except Exception as e:
+        print(f"⚠️ Error fetching previous states: {e}")
         return {}, "Error"
+
+# FIX 7: Schema Control Validations
+def validate_schema(df):
+    missing_cols = [col for col in EXPECTED_COLUMNS if col not in df.columns]
+    if missing_cols:
+        print(f"❌ Schema error! Missing columns: {missing_cols}")
+        sys.exit(1)
+    
+    return df[EXPECTED_COLUMNS]  # Ensure strict column ordering and drop unmapped columns
+
+# FIX 2 & 9: Deduplication + Daily Snapshot Guarantee
+def remove_existing_rows(df, today_date):
+    try:
+        insp = inspect(engine)
+        if not insp.has_table("etf_metrics"):
+            return df
+            
+        query = f"SELECT symbol FROM etf_metrics WHERE date = '{today_date}'"
+        existing_df = pd.read_sql(query, engine)
+        existing_symbols = existing_df["symbol"].tolist()
+        
+        if existing_symbols:
+            filtered_df = df[~df["symbol"].isin(existing_symbols)]
+            print(f"🔄 Deduplication: Filtered out {len(df) - len(filtered_df)} rows already existing for today.")
+            return filtered_df
+    except Exception as e:
+        print(f"⚠️ Error during deduplication check: {e}")
+        
+    return df
+
+# FIX 1: Safe DB Write Transaction (Append + Rollback on error)
+def save_to_db(df):
+    if df.empty:
+        print("ℹ️ No new distinct records to insert for today.")
+        return
+        
+    try:
+        print("💾 Initializing secure database transaction...")
+        with engine.begin() as conn:  # Context manager guarantees COMMIT or ROLLBACK
+            df.to_sql("etf_metrics", conn, if_exists="append", index=False)
+        print("✅ DB Transaction Committed Successfully.")
+    except Exception as e:
+        print(f"❌ DB Write Error: {e}")
+        print("🚨 Transaction Rolled Back. Hard failing pipeline.")
+        sys.exit(1)
+
 
 # ==============================
 # DISPLAY HELPERS
@@ -342,97 +407,109 @@ def print_clean_table(df, columns, headers):
         print(display_df[columns].rename(columns=dict(zip(columns, headers))).to_string(index=False))
 
 # ==============================
-# MAIN EXECUTOR
+# MAIN EXECUTOR (FIX 8: Fail Fast Wrapping)
 # ==============================
 
 def main():
-    ist_tz = ZoneInfo('Asia/Kolkata')
-    today_str = datetime.now(ist_tz).strftime("%B %d, %Y")
-    
-    print("=" * 80)
-    print(f" ETF QUANTITATIVE INVESTMENT GUIDE | {today_str}".center(80))
-    print("=" * 80)
-
-    df = process_all()
-    
-    if df.empty:
-        print("Error: Could not retrieve market data.")
-        return
-
-    # Process Logic & States
-    df = classify(df)
-    prev_states, last_run_date = get_previous_states()
-    df["prev_action"] = df["symbol"].map(prev_states).fillna("NONE")
-    
-    # Save to DB 
-    save_df = df.drop(columns=["prev_action"])
-    save_df["date"] = datetime.now(ist_tz).date()
     try:
-        save_df.to_sql("etf_metrics", engine, if_exists="append", index=False)
-    except:
-        save_df.to_sql("etf_metrics", engine, if_exists="replace", index=False)
-
-    print(f"Comparing today's data against last run: {last_run_date}\n")
-
-    # Generate Delta DataFrames
-    new_buys = df[(df["action"] == "BUY") & (df["prev_action"] != "BUY")].sort_values("rank")
-    maintained_buys = df[(df["action"] == "BUY") & (df["prev_action"] == "BUY")].sort_values("rank")
-    sell_alerts = df[(df["prev_action"].isin(["BUY", "HOLD"])) & (df["action"].isin(["SELL", "AVOID"]))].sort_values("rank")
-    hold_df = df[df["action"] == "HOLD"].sort_values("rank")
-
-    # ==============================
-    # 📝 IN-MEMORY OUTPUT CAPTURE
-    # ==============================
-    output_buffer = io.StringIO()
-    original_stdout = sys.stdout
-    sys.stdout = output_buffer 
-    
-    print(f"REPORT DATE: {today_str}\n")
-    
-    if not sell_alerts.empty:
-        print("🚨 ACTION REQUIRED: DOWNGRADED TO SELL (Exit these positions)")
-        print("-" * 80)
-        print_clean_table(sell_alerts, ["symbol", "prev_action", "cycle", "price", "50DMA", "exhausted"], ["ETF", "Previous Status", "Current Cycle", "Price", "50 DMA", "Is Exhausted?"])
-        print()
-
-    print("🟢 NEW BUYS (Triggered Today)")
-    print("-" * 80)
-    print_clean_table(new_buys, ["symbol", "theme", "rank", "ret_3m", "pullback"], ["ETF", "Theme", "Rank", "3M Return", "Pullback"])
-    
-    print("\n🔵 MAINTAINED BUYS (Already recommended on previous runs)")
-    print("-" * 80)
-    print_clean_table(maintained_buys, ["symbol", "theme", "rank", "ret_3m", "stretch"], ["ETF", "Theme", "Rank", "3M Return", "Stretch"])
-
-    print("\n🟡 HOLD (Healthy Uptrends, keep if you already own)")
-    print("-" * 80)
-    print_clean_table(hold_df, ["symbol", "rank", "price", "50DMA", "stretch"], ["ETF", "Rank", "Price", "50 DMA", "Stretch"])
-
-    print("\n💰 RECOMMENDED PORTFOLIO ALLOCATION (NEW CAPITAL)")
-    print("-" * 80)
-    buy_df = df[df["action"] == "BUY"]
-    if not buy_df.empty:
-        weight = round(100 / len(buy_df), 2)
-        for _, row in buy_df.iterrows():
-            print(f"  • {row['symbol']:<15} : {weight}% ({row['theme']})")
-    else:
-        print("  --> NO NEW BUYS MEETING CRITERIA TODAY. HOLD CASH.")
+        ist_tz = ZoneInfo('Asia/Kolkata')
+        now_ist = datetime.now(ist_tz)
+        today_str = now_ist.strftime("%B %d, %Y")
+        today_date = now_ist.date()
         
-    print("\n" + "=" * 80)
-    print(" 📊 MASTER ETF UNIVERSE METRICS (ALL DATA)".center(80))
-    print("=" * 80)
-    
-    master_df = df.sort_values("rank")
-    print_clean_table(master_df, ["symbol", "rank", "action", "cycle", "price", "ret_1m", "ret_3m", "volatility", "pullback", "stretch", "exhausted"], ["ETF", "Rank", "Status", "Cycle", "Price", "1M Ret", "3M Ret", "Vol", "Pullback", "Stretch", "Exhausted"])
-    print("\n" + "=" * 80 + "\n")
+        print("=" * 80)
+        print(f" ETF QUANTITATIVE INVESTMENT GUIDE | {today_str}".center(80))
+        print("=" * 80)
 
-    # ==============================
-    # 🔚 RESTORE CONSOLE & TRIGGER AI
-    # ==============================
-    sys.stdout = original_stdout 
-    captured_report = output_buffer.getvalue()
+        # 1. Validate DB Integrity
+        validate_db()
 
-    print(captured_report)
-    run_ai_analysis_and_notify(captured_report)
+        # 2. Process All Data
+        df = process_all()
+        if df.empty:
+            print("❌ Critical: Market data frame is empty. Failing pipeline.")
+            sys.exit(1)
+
+        # 3. Process Logic
+        df = classify(df)
+        
+        # 4. State Retrieval
+        prev_states, last_run_date = get_previous_states()
+        df["prev_action"] = df["symbol"].map(prev_states).fillna("NONE")
+        
+        # 5. Database Save Pipeline
+        save_df = df.drop(columns=["prev_action"])
+        save_df["date"] = today_date
+        
+        save_df = validate_schema(save_df)                 # Enforce shape
+        save_df = remove_existing_rows(save_df, today_date) # Enforce Idempotency
+        save_to_db(save_df)                                # Safe Transaction Write
+
+        print(f"\nComparing today's data against last run: {last_run_date}\n")
+
+        # 6. Generate Delta DataFrames
+        new_buys = df[(df["action"] == "BUY") & (df["prev_action"] != "BUY")].sort_values("rank")
+        maintained_buys = df[(df["action"] == "BUY") & (df["prev_action"] == "BUY")].sort_values("rank")
+        sell_alerts = df[(df["prev_action"].isin(["BUY", "HOLD"])) & (df["action"].isin(["SELL", "AVOID"]))].sort_values("rank")
+        hold_df = df[df["action"] == "HOLD"].sort_values("rank")
+
+        # ==============================
+        # 📝 IN-MEMORY OUTPUT CAPTURE
+        # ==============================
+        output_buffer = io.StringIO()
+        original_stdout = sys.stdout
+        sys.stdout = output_buffer 
+        
+        print(f"REPORT DATE: {today_str}\n")
+        
+        if not sell_alerts.empty:
+            print("🚨 ACTION REQUIRED: DOWNGRADED TO SELL (Exit these positions)")
+            print("-" * 80)
+            print_clean_table(sell_alerts, ["symbol", "prev_action", "cycle", "price", "50DMA", "exhausted"], ["ETF", "Previous Status", "Current Cycle", "Price", "50 DMA", "Is Exhausted?"])
+            print()
+
+        print("🟢 NEW BUYS (Triggered Today)")
+        print("-" * 80)
+        print_clean_table(new_buys, ["symbol", "theme", "rank", "ret_3m", "pullback"], ["ETF", "Theme", "Rank", "3M Return", "Pullback"])
+        
+        print("\n🔵 MAINTAINED BUYS (Already recommended on previous runs)")
+        print("-" * 80)
+        print_clean_table(maintained_buys, ["symbol", "theme", "rank", "ret_3m", "stretch"], ["ETF", "Theme", "Rank", "3M Return", "Stretch"])
+
+        print("\n🟡 HOLD (Healthy Uptrends, keep if you already own)")
+        print("-" * 80)
+        print_clean_table(hold_df, ["symbol", "rank", "price", "50DMA", "stretch"], ["ETF", "Rank", "Price", "50 DMA", "Stretch"])
+
+        print("\n💰 RECOMMENDED PORTFOLIO ALLOCATION (NEW CAPITAL)")
+        print("-" * 80)
+        buy_df = df[df["action"] == "BUY"]
+        if not buy_df.empty:
+            weight = round(100 / len(buy_df), 2)
+            for _, row in buy_df.iterrows():
+                print(f"  • {row['symbol']:<15} : {weight}% ({row['theme']})")
+        else:
+            print("  --> NO NEW BUYS MEETING CRITERIA TODAY. HOLD CASH.")
+            
+        print("\n" + "=" * 80)
+        print(" 📊 MASTER ETF UNIVERSE METRICS (ALL DATA)".center(80))
+        print("=" * 80)
+        
+        master_df = df.sort_values("rank")
+        print_clean_table(master_df, ["symbol", "rank", "action", "cycle", "price", "ret_1m", "ret_3m", "volatility", "pullback", "stretch", "exhausted"], ["ETF", "Rank", "Status", "Cycle", "Price", "1M Ret", "3M Ret", "Vol", "Pullback", "Stretch", "Exhausted"])
+        print("\n" + "=" * 80 + "\n")
+
+        # ==============================
+        # 🔚 RESTORE CONSOLE & TRIGGER AI
+        # ==============================
+        sys.stdout = original_stdout 
+        captured_report = output_buffer.getvalue()
+
+        print(captured_report)
+        run_ai_analysis_and_notify(captured_report)
+        
+    except Exception as e:
+        print(f"\n❌ CRITICAL PIPELINE FAILURE: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
