@@ -1,17 +1,18 @@
+import os
+import time
+import io
+import sys
+import warnings
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine, inspect
-from datetime import datetime
-import warnings
-import io
-import sys
 import requests
 import urllib3
+from sqlalchemy import create_engine, inspect
 from google import genai
-import time
-from zoneinfo import ZoneInfo
-import os
 
 # Suppress warnings for clean console output
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -108,46 +109,35 @@ def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
         return
 
     ai_prompt = (
-    "You are a professional quantitative trading analyst.\n\n"
-
-    "Analyze the ETF rotation report below and generate a READY-TO-SEND TELEGRAM MESSAGE.\n\n"
-
-    "STRICT RULES:\n"
-    "- Keep output short, sharp, and actionable\n"
-    "- No explanations, no raw tables\n"
-    "- Focus only on decisions and market insight\n"
-    "- Use clean formatting with emojis\n"
-    "- Avoid listing too many ETFs\n\n"
-
-    "OUTPUT STRUCTURE:\n\n"
-
-    "🔥 Market:\n"
-    "- 1–2 lines describing overall market condition (breadth, trend, leadership)\n\n"
-
-    "📈 BUY:\n"
-    "- List ONLY new buy signals\n"
-    "- Format: ETF (Theme) – reason in 1 short line\n\n"
-
-    "🟡 HOLD:\n"
-    "- Mention only strongest leaders worth holding\n"
-    "- Do NOT list everything\n\n"
-
-    "❌ EXIT:\n"
-    "- Summarize weakness (sectors/themes), NOT full list\n\n"
-
-    "💰 Allocation:\n"
-    "- Clear capital allocation guidance (%, cash if needed)\n\n"
-
-    "⚠️ Risk:\n"
-    "- One-line key risk\n\n"
-
-    "TONE:\n"
-    "- Professional\n"
-    "- Confident\n"
-    "- No hype, no generic advice\n\n"
-
-    "[ETF REPORT DATA]\n"
-    f"{snapshot_data.strip()}"
+        "You are a professional quantitative trading analyst.\n\n"
+        "Analyze the ETF rotation report below and generate a READY-TO-SEND TELEGRAM MESSAGE.\n\n"
+        "STRICT RULES:\n"
+        "- Keep output short, sharp, and actionable\n"
+        "- No explanations, no raw tables\n"
+        "- Focus only on decisions and market insight\n"
+        "- Use clean formatting with emojis\n"
+        "- Avoid listing too many ETFs\n\n"
+        "OUTPUT STRUCTURE:\n\n"
+        "🔥 Market:\n"
+        "- 1–2 lines describing overall market condition (breadth, trend, leadership)\n\n"
+        "📈 BUY:\n"
+        "- List ONLY new buy signals\n"
+        "- Format: ETF (Theme) – reason in 1 short line\n\n"
+        "🟡 HOLD:\n"
+        "- Mention only strongest leaders worth holding\n"
+        "- Do NOT list everything\n\n"
+        "❌ EXIT:\n"
+        "- Summarize weakness (sectors/themes), NOT full list\n\n"
+        "💰 Allocation:\n"
+        "- Clear capital allocation guidance (%, cash if needed)\n\n"
+        "⚠️ Risk:\n"
+        "- One-line key risk\n\n"
+        "TONE:\n"
+        "- Professional\n"
+        "- Confident\n"
+        "- No hype, no generic advice\n\n"
+        "[ETF REPORT DATA]\n"
+        f"{snapshot_data.strip()}"
     )
 
     for attempt in range(max_retries):
@@ -172,30 +162,17 @@ def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
             # If it's a server overload (503) or rate limit (429), try again
             if "503" in error_msg or "429" in error_msg:
                 if attempt < max_retries - 1:
-                    # Exponential backoff: waits 5 seconds, then 10 seconds...
                     wait_time = (2 ** attempt) * 5 
                     print(f"⏳ Server busy. Retrying in {wait_time} seconds...\n")
                     time.sleep(wait_time)
                 else:
                     print("🚨 Max retries reached. Gemini API is too busy to answer right now.")
             else:
-                # If it's a different error (like a bad API key), stop trying immediately
                 break
 
 # ==============================
-# FETCH & METRICS
+# BATCH FETCH & METRICS
 # ==============================
-
-def fetch_data(symbol):
-    try:
-        df = yf.download(symbol, period="1y", interval="1d", progress=False)
-        if df.empty or len(df) < 200: return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df["symbol"] = symbol
-        return df
-    except:
-        return None
 
 def calculate_metrics(df):
     df["20DMA"] = df["Close"].rolling(20).mean()
@@ -236,19 +213,42 @@ def calculate_metrics(df):
 
 def process_all():
     results = []
-    total = len(ETF_LIST)
-    print(f"Fetching data for {total} ETFs...")
-    for idx, etf in enumerate(ETF_LIST, 1):
-        print(f"[{idx}/{total}] Analyzing {etf}...", end="\r")
-        df = fetch_data(etf)
-        if df is not None:
+    print(f"🚀 Batch fetching data for {len(ETF_LIST)} ETFs in a single API call...")
+
+    try:
+        raw_data = yf.download(ETF_LIST, period="1y", interval="1d", group_by="ticker", progress=False)
+    except Exception as e:
+        print(f"⚠️ Batch download failed: {e}")
+        return pd.DataFrame()
+
+    if raw_data.empty:
+        print("⚠️ Warning: No data was retrieved from Yahoo Finance.")
+        return pd.DataFrame()
+
+    print("✅ Download successful. Processing metrics...")
+
+    for etf in ETF_LIST:
+        try:
+            df = raw_data[etf].copy()
+            df = df.dropna(how='all') 
+
+            if df.empty or len(df) < 200: 
+                continue
+
+            df["symbol"] = etf
             m = calculate_metrics(df)
             if m: results.append(m)
-            
-    print("\nData fetch complete.\n")
-    df = pd.DataFrame(results)
-    df["rank"] = df["ret_3m"].rank(ascending=False, method="min").astype(int)
-    return df
+
+        except KeyError:
+            print(f"⚠️ Could not process {etf} (Not found in Yahoo's batch return).")
+            continue
+
+    if not results:
+        return pd.DataFrame()
+
+    result_df = pd.DataFrame(results)
+    result_df["rank"] = result_df["ret_3m"].rank(ascending=False, method="min").astype(int)
+    return result_df
 
 # ==============================
 # LOGIC & CLASSIFICATION
@@ -336,6 +336,7 @@ def main():
     print("=" * 80)
 
     df = process_all()
+    
     if df.empty:
         print("Error: Could not retrieve market data.")
         return
@@ -366,7 +367,7 @@ def main():
     # ==============================
     output_buffer = io.StringIO()
     original_stdout = sys.stdout
-    sys.stdout = output_buffer # Redirect prints to memory buffer
+    sys.stdout = output_buffer 
     
     print(f"REPORT DATE: {today_str}\n")
     
@@ -409,7 +410,7 @@ def main():
     # ==============================
     # 🔚 RESTORE CONSOLE & TRIGGER AI
     # ==============================
-    sys.stdout = original_stdout # Restore normal printing
+    sys.stdout = original_stdout 
     captured_report = output_buffer.getvalue()
 
     # 1. Print the report to the console so you can see it locally
