@@ -3,6 +3,7 @@ import time
 import io
 import sys
 import warnings
+import random
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -142,7 +143,7 @@ def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
 
     for attempt in range(max_retries):
         try:
-            print(f"🤖 Analyzing market data with Gemini API (Attempt {attempt + 1}/{max_retries})...")
+            print(f"\n🤖 Analyzing market data with Gemini API (Attempt {attempt + 1}/{max_retries})...")
             client = genai.Client(api_key=GEMINI_API_KEY)
             response = client.models.generate_content(model=GEMINI_MODEL, contents=[ai_prompt])
             ai_response_text = response.text
@@ -171,8 +172,37 @@ def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
                 break
 
 # ==============================
-# BATCH FETCH & METRICS
+# POLITE CRAWLER FETCH & METRICS
 # ==============================
+
+def fetch_data(symbol, session, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            df = yf.download(symbol, period="1y", interval="1d", progress=False, session=session)
+            
+            if df is not None and not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                
+                if len(df) >= 200:
+                    df["symbol"] = symbol
+                    return df
+            
+            return None # Skip if not enough historical data
+
+        except Exception as e:
+            error_msg = str(e)
+            if "Rate limit" in error_msg or "429" in error_msg or "Too Many Requests" in error_msg:
+                if attempt < max_retries - 1:
+                    backoff = random.uniform(5, 10) * (attempt + 1)
+                    print(f"\n  ⚠️ Rate limited on {symbol}. Backing off for {backoff:.1f}s...")
+                    time.sleep(backoff)
+                    continue
+            
+            print(f"\n  ❌ Failed to fetch {symbol}: {error_msg}")
+            return None
+            
+    return None
 
 def calculate_metrics(df):
     df["20DMA"] = df["Close"].rolling(20).mean()
@@ -213,37 +243,36 @@ def calculate_metrics(df):
 
 def process_all():
     results = []
-    print(f"🚀 Batch fetching data for {len(ETF_LIST)} ETFs in a single API call...")
+    total = len(ETF_LIST)
+    print(f"🚀 Fetching data for {total} ETFs (using polite pacing)...")
 
-    try:
-        raw_data = yf.download(ETF_LIST, period="1y", interval="1d", group_by="ticker", progress=False)
-    except Exception as e:
-        print(f"⚠️ Batch download failed: {e}")
-        return pd.DataFrame()
+    # Create a persistent session to mimic a standard browser
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive"
+    })
 
-    if raw_data.empty:
-        print("⚠️ Warning: No data was retrieved from Yahoo Finance.")
-        return pd.DataFrame()
+    for idx, etf in enumerate(ETF_LIST, 1):
+        sys.stdout.write(f"\r[{idx}/{total}] Fetching {etf}...".ljust(50))
+        sys.stdout.flush()
 
-    print("✅ Download successful. Processing metrics...")
+        df = fetch_data(etf, session)
 
-    for etf in ETF_LIST:
-        try:
-            df = raw_data[etf].copy()
-            df = df.dropna(how='all') 
-
-            if df.empty or len(df) < 200: 
-                continue
-
-            df["symbol"] = etf
+        if df is not None:
             m = calculate_metrics(df)
             if m: results.append(m)
 
-        except KeyError:
-            print(f"⚠️ Could not process {etf} (Not found in Yahoo's batch return).")
-            continue
+        # Inject randomized jitter between 1.5 and 3.5 seconds to bypass WAF patterns
+        if idx < total:
+            time.sleep(random.uniform(1.5, 3.5))
+
+    print("\n✅ Data fetch complete.\n")
 
     if not results:
+        print("⚠️ Warning: No data was retrieved. Yahoo Finance is blocking all requests.")
         return pd.DataFrame()
 
     result_df = pd.DataFrame(results)
