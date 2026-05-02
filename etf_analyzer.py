@@ -15,7 +15,6 @@ import urllib3
 from sqlalchemy import create_engine, inspect, text
 from google import genai
 
-# Suppress warnings for clean console output
 warnings.simplefilter(action='ignore', category=FutureWarning)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -25,9 +24,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-GEMINI_MODEL       = "gemini-3.1-flash-lite-preview"
-
-DB_NAME = "sqlite:///etf_rotation.db"
+GEMINI_MODEL       = "gemini-2.5-flash-lite"
+DB_NAME            = "sqlite:///etf_rotation.db"
 
 ETF_LIST = [
     "GOLDBEES.NS","SILVERBEES.NS","NIFTYBEES.NS","BANKBEES.NS",
@@ -65,18 +63,26 @@ THEME_MAP = {
     "JUNIORBEES.NS":"NEXT50"
 }
 
-# FIX 7: Explicit Schema Control
+# UPDATED: Added RSI and Momentum Score to schema
 EXPECTED_COLUMNS = [
-    'symbol', 'theme', 'price', '50DMA', 'cycle', 'ret_1m', 'ret_3m', 
-    'volatility', 'avg_volume', 'pullback', 'stretch', 'rank', 
-    'exhausted', 'action', 'date'
+    'symbol', 'theme', 'price', '50DMA', 'cycle', 'rsi', 'mom_score',
+    'ret_1m', 'ret_3m', 'ret_6m', 'volatility', 'avg_volume', 
+    'pullback', 'stretch', 'rank', 'exhausted', 'action', 'date'
 ]
 
-engine = create_engine(DB_NAME)
+def get_db_engine():
+    return create_engine(DB_NAME)
 
-# ==============================
-# TELEGRAM & AI LOGIC
-# ==============================
+def check_credentials():
+    if not GEMINI_API_KEY or "YOUR_" in GEMINI_API_KEY:
+        print("❌ CRITICAL: Missing Gemini API Key.")
+        sys.exit(1)
+    if not TELEGRAM_BOT_TOKEN or "YOUR_" in TELEGRAM_BOT_TOKEN:
+        print("❌ CRITICAL: Missing Telegram Bot Token.")
+        sys.exit(1)
+    if not TELEGRAM_CHAT_ID or "YOUR_" in TELEGRAM_CHAT_ID:
+        print("❌ CRITICAL: Missing Telegram Chat ID.")
+        sys.exit(1)
 
 def send_telegram_chunk(text: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -88,11 +94,8 @@ def send_telegram_chunk(text: str) -> bool:
         return False
 
 def send_telegram_message(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or "YOUR_" in TELEGRAM_BOT_TOKEN: 
-        return False
-        
     clean = text.replace('**', '*').replace('##', '').replace('`', "'").replace('_', '-')
-    max_len = 4000
+    max_len = 3900 
     
     if len(clean) <= max_len: 
         return send_telegram_chunk(clean)
@@ -102,19 +105,15 @@ def send_telegram_message(text: str) -> bool:
     for line in lines:
         if len(current) + len(line) + 1 > max_len:
             if current and not send_telegram_chunk(f"Part {part}:\n\n{current}"): success = False
-            part += 1; current = line
+            part += 1; current = line + "\n"
         else:
-            current = (current + "\n" + line) if current else line
+            current += line + "\n"
             
-    if current and not send_telegram_chunk(f"Part {part}:\n\n{current}"): 
+    if current and not send_telegram_chunk(f"Part {part}:\n\n{current.strip()}"): 
         success = False
     return success
 
 def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
-    if not GEMINI_API_KEY or "YOUR_" in GEMINI_API_KEY: 
-        print("⚠️ Missing Gemini API Key. Skipping AI Analysis.")
-        return
-
     ai_prompt = (
         "You are a professional quantitative trading analyst.\n\n"
         "Analyze the ETF rotation report below and generate a READY-TO-SEND TELEGRAM MESSAGE.\n\n"
@@ -127,8 +126,8 @@ def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
         "OUTPUT STRUCTURE:\n\n"
         "🔥 Market:\n"
         "- 1–2 lines describing overall market condition (breadth, trend, leadership)\n\n"
-        "📈 BUY:\n"
-        "- List ONLY new buy signals\n"
+        "📈 BUY (Momentum Leaders):\n"
+        "- List ONLY new buy signals. Mention their Momentum Score & RSI.\n"
         "- Format: ETF (Theme) – reason in 1 short line\n\n"
         "🟡 HOLD:\n"
         "- Mention only strongest leaders worth holding\n"
@@ -140,26 +139,23 @@ def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
         "⚠️ Risk:\n"
         "- One-line key risk\n\n"
         "TONE:\n"
-        "- Professional\n"
-        "- Confident\n"
-        "- No hype, no generic advice\n\n"
+        "- Professional, Confident, No hype\n\n"
         "[ETF REPORT DATA]\n"
         f"{snapshot_data.strip()}"
     )
 
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
     for attempt in range(max_retries):
         try:
             print(f"\n🤖 Analyzing market data with Gemini API (Attempt {attempt + 1}/{max_retries})...")
-            client = genai.Client(api_key=GEMINI_API_KEY)
             response = client.models.generate_content(model=GEMINI_MODEL, contents=[ai_prompt])
-            ai_response_text = response.text
             
             print("📲 Sending AI Analysis to Telegram...")
-            if send_telegram_message(ai_response_text):
+            if send_telegram_message(response.text):
                 print("✅ Telegram Notification Sent Successfully!")
             else:
                 print("❌ Failed to send Telegram message.")
-                
             return  
 
         except Exception as e:
@@ -171,27 +167,20 @@ def run_ai_analysis_and_notify(snapshot_data: str, max_retries=3):
                     print(f"⏳ Server busy. Retrying in {wait_time} seconds...\n")
                     time.sleep(wait_time)
                 else:
-                    print("🚨 Max retries reached. Gemini API is too busy to answer right now.")
+                    print("🚨 Max retries reached. Gemini API is too busy.")
             else:
                 break
-
-# ==============================
-# FETCH & METRICS
-# ==============================
 
 def fetch_data(symbol, max_retries=3):
     for attempt in range(max_retries):
         try:
             df = yf.download(symbol, period="1y", interval="1d", progress=False)
-            
             if df is not None and not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
-                
                 if len(df) >= 200:
                     df["symbol"] = symbol
                     return df
-            
             return None 
 
         except Exception as e:
@@ -202,31 +191,46 @@ def fetch_data(symbol, max_retries=3):
                     print(f"\n  ⚠️ Rate limited on {symbol}. Backing off for {backoff:.1f}s...")
                     time.sleep(backoff)
                     continue
-            
             print(f"\n  ❌ Failed to fetch {symbol}: {error_msg}")
             return None
-            
     return None
 
 def calculate_metrics(df):
+    # Standard Moving Averages
     df["20DMA"] = df["Close"].rolling(20).mean()
     df["50DMA"] = df["Close"].rolling(50).mean()
     df["200DMA"] = df["Close"].rolling(200).mean()
     df["returns"] = df["Close"].pct_change()
+    
+    # Volatility and Volume
+    df["vol_20"] = df["returns"].rolling(20).std()
+    df["avg_vol_20"] = df["Volume"].rolling(20).mean()
 
-    if pd.isna(df["200DMA"].iloc[-1]): return None
+    # Wilder's 14-Day RSI (Momentum Indicator)
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
+    loss = -delta.clip(upper=0).ewm(com=13, adjust=False).mean()
+    rs = gain / loss
+    df["RSI"] = 100 - (100 / (1 + rs))
 
     latest = df.iloc[-1]
+    if pd.isna(latest["200DMA"]): return None
+
     close = float(latest["Close"])
     dma20 = float(latest["20DMA"])
     dma50 = float(latest["50DMA"])
     dma200 = float(latest["200DMA"])
+    rsi = float(latest["RSI"])
+    
+    # Multi-Timeframe Returns
+    ret_1m = (close / float(df["Close"].iloc[-22])) - 1
+    ret_3m = (close / float(df["Close"].iloc[-66])) - 1
+    ret_6m = (close / float(df["Close"].iloc[-130])) - 1
 
-    ret_1m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-22])) - 1
-    ret_3m = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-66])) - 1
-    volatility = float(df["returns"].rolling(20).std().iloc[-1])
-    avg_volume = float(df["Volume"].rolling(20).mean().iloc[-1])
+    # Composite Momentum Score (Weights: 1M=30%, 3M=50%, 6M=20%)
+    mom_score = (ret_1m * 0.30) + (ret_3m * 0.50) + (ret_6m * 0.20)
 
+    # Trend Cycle Classification
     if close > dma50 and dma50 > dma200: cycle = "UPTREND"
     elif close < dma50 and dma50 < dma200: cycle = "DOWNTREND"
     else: cycle = "SIDEWAYS"
@@ -237,10 +241,13 @@ def calculate_metrics(df):
         "price": round(close, 2),
         "50DMA": round(dma50, 2),
         "cycle": cycle,
+        "rsi": round(rsi, 2),
+        "mom_score": round(mom_score, 4),
         "ret_1m": round(ret_1m, 4),
         "ret_3m": round(ret_3m, 4),
-        "volatility": round(volatility, 4),
-        "avg_volume": int(avg_volume),
+        "ret_6m": round(ret_6m, 4),
+        "volatility": round(float(latest["vol_20"]), 4),
+        "avg_volume": int(latest["avg_vol_20"]),
         "pullback": round(abs(close - dma20) / dma20, 4),
         "stretch": round((close - dma50) / dma50, 4)
     }
@@ -255,13 +262,12 @@ def process_all():
         sys.stdout.flush()
 
         df = fetch_data(etf)
-
         if df is not None:
             m = calculate_metrics(df)
             if m: results.append(m)
 
         if idx < total:
-            time.sleep(random.uniform(1.0, 2.5))
+            time.sleep(random.uniform(1.0, 2.0))
 
     print("\n✅ Data fetch complete.\n")
 
@@ -270,19 +276,18 @@ def process_all():
         return pd.DataFrame()
 
     result_df = pd.DataFrame(results)
-    result_df["rank"] = result_df["ret_3m"].rank(ascending=False, method="min").astype(int)
+    
+    # RANKING: Now based on True Composite Momentum, not just 3-month returns
+    result_df["rank"] = result_df["mom_score"].rank(ascending=False, method="min").astype(int)
     return result_df
 
-# ==============================
-# LOGIC & CLASSIFICATION
-# ==============================
-
 def detect_exhaustion(row):
+    # Advanced exhaustion logic using RSI and Over-extension
     signals = 0
-    if row["ret_1m"] < row["ret_3m"] / 3: signals += 1
-    if row["stretch"] > 0.1: signals += 1
-    if row["volatility"] > 0.035: signals += 1
-    if row["rank"] > 10: signals += 1
+    if row["rsi"] > 75: signals += 2             # Severely Overbought
+    if row["stretch"] > 0.08: signals += 1       # Price is extended >8% above 50DMA
+    if row["volatility"] > 0.035: signals += 1   # Price action becoming erratic
+    if row["ret_1m"] < 0: signals += 1           # Immediate momentum has stalled
     return signals >= 2
 
 def pick_unique_themes(df):
@@ -306,16 +311,27 @@ def classify(df):
     mask_hold = (df["cycle"] == "UPTREND") & (~df["exhausted"]) & (df["price"] >= df["50DMA"])
     df.loc[mask_hold, "action"] = "HOLD"
     
-    candidates = df[mask_hold & (df["avg_volume"] > 50000) & (df["volatility"] < 0.04)].copy()
+    # ADVANCED BUY LOGIC: Volume > 50k, Low Volatility, RSI Sweet Spot (55-70) indicating active strength
+    mask_buy_candidates = (
+        mask_hold & 
+        (df["avg_volume"] > 50000) & 
+        (df["volatility"] < 0.035) & 
+        (df["rsi"] >= 55) & 
+        (df["rsi"] <= 72) &
+        (df["mom_score"] > 0) # Must have positive aggregate momentum
+    )
+    
+    candidates = df[mask_buy_candidates].copy()
     invest = pick_unique_themes(candidates)
+    
     if not invest.empty:
-        invest = invest[invest["pullback"] < 0.05]
+        # Require a modest 20DMA pullback entry (don't chase)
+        invest = invest[invest["pullback"] < 0.04]
         df.loc[df["symbol"].isin(invest["symbol"]), "action"] = "BUY"
         
     return df
 
-# FIX 6: DB File Integrity Check
-def validate_db():
+def validate_db(engine):
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -324,8 +340,7 @@ def validate_db():
         print("🚨 Database corrupted or inaccessible. Hard failing pipeline.")
         sys.exit(1)
 
-# FIX 3: Reliable State Fetch (Distinct snapshot)
-def get_previous_states():
+def get_previous_states(engine):
     try:
         insp = inspect(engine)
         if not insp.has_table("etf_metrics"): 
@@ -344,17 +359,14 @@ def get_previous_states():
         print(f"⚠️ Error fetching previous states: {e}")
         return {}, "Error"
 
-# FIX 7: Schema Control Validations
 def validate_schema(df):
     missing_cols = [col for col in EXPECTED_COLUMNS if col not in df.columns]
     if missing_cols:
         print(f"❌ Schema error! Missing columns: {missing_cols}")
         sys.exit(1)
-    
-    return df[EXPECTED_COLUMNS]  # Ensure strict column ordering and drop unmapped columns
+    return df[EXPECTED_COLUMNS]
 
-# FIX 2 & 9: Deduplication + Daily Snapshot Guarantee
-def remove_existing_rows(df, today_date):
+def remove_existing_rows(df, today_date, engine):
     try:
         insp = inspect(engine)
         if not insp.has_table("etf_metrics"):
@@ -373,15 +385,14 @@ def remove_existing_rows(df, today_date):
         
     return df
 
-# FIX 1: Safe DB Write Transaction (Append + Rollback on error)
-def save_to_db(df):
+def save_to_db(df, engine):
     if df.empty:
         print("ℹ️ No new distinct records to insert for today.")
         return
         
     try:
         print("💾 Initializing secure database transaction...")
-        with engine.begin() as conn:  # Context manager guarantees COMMIT or ROLLBACK
+        with engine.begin() as conn: 
             df.to_sql("etf_metrics", conn, if_exists="append", index=False)
         print("✅ DB Transaction Committed Successfully.")
     except Exception as e:
@@ -389,28 +400,22 @@ def save_to_db(df):
         print("🚨 Transaction Rolled Back. Hard failing pipeline.")
         sys.exit(1)
 
-
-# ==============================
-# DISPLAY HELPERS
-# ==============================
-
 def print_clean_table(df, columns, headers):
     if df.empty:
         print("  --> No ETFs currently match this criteria.")
         return
     display_df = df.copy()
-    for col in ["ret_1m", "ret_3m", "pullback", "stretch", "volatility"]:
+    for col in ["mom_score", "ret_1m", "ret_3m", "ret_6m", "pullback", "stretch", "volatility"]:
         if col in display_df.columns:
             display_df[col] = (display_df[col] * 100).round(2).astype(str) + "%"
             
     with pd.option_context('display.max_rows', None, 'display.max_columns', None, 'display.width', 1000):
         print(display_df[columns].rename(columns=dict(zip(columns, headers))).to_string(index=False))
 
-# ==============================
-# MAIN EXECUTOR (FIX 8: Fail Fast Wrapping)
-# ==============================
-
 def main():
+    check_credentials()
+    engine = get_db_engine()
+
     try:
         ist_tz = ZoneInfo('Asia/Kolkata')
         now_ist = datetime.now(ist_tz)
@@ -421,41 +426,32 @@ def main():
         print(f" ETF QUANTITATIVE INVESTMENT GUIDE | {today_str}".center(80))
         print("=" * 80)
 
-        # 1. Validate DB Integrity
-        validate_db()
+        validate_db(engine)
 
-        # 2. Process All Data
         df = process_all()
         if df.empty:
             print("❌ Critical: Market data frame is empty. Failing pipeline.")
             sys.exit(1)
 
-        # 3. Process Logic
         df = classify(df)
         
-        # 4. State Retrieval
-        prev_states, last_run_date = get_previous_states()
+        prev_states, last_run_date = get_previous_states(engine)
         df["prev_action"] = df["symbol"].map(prev_states).fillna("NONE")
         
-        # 5. Database Save Pipeline
         save_df = df.drop(columns=["prev_action"])
         save_df["date"] = today_date
         
-        save_df = validate_schema(save_df)                 # Enforce shape
-        save_df = remove_existing_rows(save_df, today_date) # Enforce Idempotency
-        save_to_db(save_df)                                # Safe Transaction Write
+        save_df = validate_schema(save_df)
+        save_df = remove_existing_rows(save_df, today_date, engine) 
+        save_to_db(save_df, engine)
 
         print(f"\nComparing today's data against last run: {last_run_date}\n")
 
-        # 6. Generate Delta DataFrames
         new_buys = df[(df["action"] == "BUY") & (df["prev_action"] != "BUY")].sort_values("rank")
         maintained_buys = df[(df["action"] == "BUY") & (df["prev_action"] == "BUY")].sort_values("rank")
         sell_alerts = df[(df["prev_action"].isin(["BUY", "HOLD"])) & (df["action"].isin(["SELL", "AVOID"]))].sort_values("rank")
         hold_df = df[df["action"] == "HOLD"].sort_values("rank")
 
-        # ==============================
-        # 📝 IN-MEMORY OUTPUT CAPTURE
-        # ==============================
         output_buffer = io.StringIO()
         original_stdout = sys.stdout
         sys.stdout = output_buffer 
@@ -465,20 +461,20 @@ def main():
         if not sell_alerts.empty:
             print("🚨 ACTION REQUIRED: DOWNGRADED TO SELL (Exit these positions)")
             print("-" * 80)
-            print_clean_table(sell_alerts, ["symbol", "prev_action", "cycle", "price", "50DMA", "exhausted"], ["ETF", "Previous Status", "Current Cycle", "Price", "50 DMA", "Is Exhausted?"])
+            print_clean_table(sell_alerts, ["symbol", "prev_action", "cycle", "rsi", "50DMA", "exhausted"], ["ETF", "Previous Status", "Current Cycle", "RSI", "50 DMA", "Is Exhausted?"])
             print()
 
         print("🟢 NEW BUYS (Triggered Today)")
         print("-" * 80)
-        print_clean_table(new_buys, ["symbol", "theme", "rank", "ret_3m", "pullback"], ["ETF", "Theme", "Rank", "3M Return", "Pullback"])
+        print_clean_table(new_buys, ["symbol", "theme", "rank", "mom_score", "rsi", "pullback"], ["ETF", "Theme", "Rank", "Mom Score", "RSI", "Pullback"])
         
         print("\n🔵 MAINTAINED BUYS (Already recommended on previous runs)")
         print("-" * 80)
-        print_clean_table(maintained_buys, ["symbol", "theme", "rank", "ret_3m", "stretch"], ["ETF", "Theme", "Rank", "3M Return", "Stretch"])
+        print_clean_table(maintained_buys, ["symbol", "theme", "rank", "mom_score", "rsi", "stretch"], ["ETF", "Theme", "Rank", "Mom Score", "RSI", "Stretch"])
 
         print("\n🟡 HOLD (Healthy Uptrends, keep if you already own)")
         print("-" * 80)
-        print_clean_table(hold_df, ["symbol", "rank", "price", "50DMA", "stretch"], ["ETF", "Rank", "Price", "50 DMA", "Stretch"])
+        print_clean_table(hold_df, ["symbol", "rank", "mom_score", "rsi", "50DMA"], ["ETF", "Rank", "Mom Score", "RSI", "50 DMA"])
 
         print("\n💰 RECOMMENDED PORTFOLIO ALLOCATION (NEW CAPITAL)")
         print("-" * 80)
@@ -495,12 +491,9 @@ def main():
         print("=" * 80)
         
         master_df = df.sort_values("rank")
-        print_clean_table(master_df, ["symbol", "rank", "action", "cycle", "price", "ret_1m", "ret_3m", "volatility", "pullback", "stretch", "exhausted"], ["ETF", "Rank", "Status", "Cycle", "Price", "1M Ret", "3M Ret", "Vol", "Pullback", "Stretch", "Exhausted"])
+        print_clean_table(master_df, ["symbol", "rank", "action", "cycle", "rsi", "mom_score", "ret_3m", "volatility", "pullback", "stretch", "exhausted"], ["ETF", "Rank", "Status", "Cycle", "RSI", "Mom Score", "3M Ret", "Vol", "Pullback", "Stretch", "Exhausted"])
         print("\n" + "=" * 80 + "\n")
 
-        # ==============================
-        # 🔚 RESTORE CONSOLE & TRIGGER AI
-        # ==============================
         sys.stdout = original_stdout 
         captured_report = output_buffer.getvalue()
 
